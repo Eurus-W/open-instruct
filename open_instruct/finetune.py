@@ -37,10 +37,10 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 
 logger = get_logger(__name__)
 
-try:
-    from hf_olmo import OLMoTokenizerFast
-except ImportError:
-    logger.warning("OLMo not installed. Ignore if using a different model.")
+# try:
+#     from hf_olmo import OLMoTokenizerFast
+# except ImportError:
+#     logger.warning("OLMo not installed. Ignore if using a different model.")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -266,6 +266,11 @@ def parse_args():
         default='mean',
         choices=['mean', 'sum'],
         help='How to reduce loss over tokens. Default is mean, but using sum can improve chat model performance.',
+    )
+    parser.add_argument(
+        '--use_svd_lora',
+        action='store_true',
+        help='Trust remote code when loading pretrained models and tokenizers. Use only when you trust the remote code.',
     )
     args = parser.parse_args()
 
@@ -584,6 +589,40 @@ def main():
         )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
+        if args.use_svd_lora:
+            #如果需要使用svd_lora,则进行如下操作
+            def initialize_lora_layer(weights, rank=64):
+
+                # 对权重进行SVD分解
+                U, S, V = torch.linalg.svd(weights, full_matrices=False)
+                # 选择最小的64个奇异值及其对应的U和V
+                U_min = U[:, -rank:]
+                S_min = S[-rank:]
+                V_min = V[-rank:, :]
+                
+                # 计算A和B
+                S_min_sqrt = torch.sqrt(S_min)
+                B = U_min @ torch.diag(S_min_sqrt)
+                A = torch.diag(S_min_sqrt) @ V_min
+                delta = B @ A
+                
+                # 返回初始化好的A和B
+                return A, B, delta
+
+            with torch.no_grad():
+                for n,p in model.named_parameters():
+                    proj_types = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+                    if any(proj in n for proj in proj_types) and (not "lora" in n) and ("base_layer" in n):
+                        parent_name = n.split(".base_layer.weight")[0]
+                        parent_module = model.get_submodule(parent_name)
+                        # import pdb
+                        # pdb.set_trace()
+                        lora_A_init, lora_B_init, delta = initialize_lora_layer(p.data.float())
+                        parent_module.base_layer.weight.data-=delta
+                        parent_module.lora_A['default'].weight.data = lora_A_init
+                        parent_module.lora_B['default'].weight.data = lora_B_init
+                        print("processed: ", parent_name)
+    
     elif args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
